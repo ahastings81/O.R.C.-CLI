@@ -21,6 +21,14 @@ O.R.C.-CLI adds a simple control layer between AI-generated commands and your ma
 - Logs all decisions to a local JSONL audit log
 - Supports one-off command review and interactive shell mode
 
+## Install
+
+Clone the repo:
+
+```bash
+git clone https://github.com/ahastings81/O.R.C.-CLI.git
+cd O.R.C.-CLI
+
 ## Example
 
 ```bash
