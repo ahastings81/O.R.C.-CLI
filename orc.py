@@ -19,7 +19,6 @@ Examples:
 
 import argparse
 import json
-import os
 import platform
 import shlex
 import subprocess
@@ -63,6 +62,39 @@ def split_command(command: str):
         return command.split()
 
 
+def normalized_tokens(command: str):
+    return [token.strip("\"'").lower() for token in split_command(command)]
+
+
+def has_token_sequence(tokens: list[str], sequence: list[str]) -> bool:
+    if not sequence or len(tokens) < len(sequence):
+        return False
+
+    for index in range(len(tokens) - len(sequence) + 1):
+        if tokens[index:index + len(sequence)] == sequence:
+            return True
+    return False
+
+
+def looks_like_orc_script(token: str) -> bool:
+    name = Path(token.strip("\"'")).name.lower()
+    return name == "orc.py"
+
+
+def is_self_invocation(command: str) -> bool:
+    tokens = split_command(command)
+    if not tokens:
+        return False
+
+    first = Path(tokens[0].strip("\"'")).name.lower()
+    interpreters = {"python", "python3", "py"}
+
+    if first in interpreters and len(tokens) >= 2:
+        return looks_like_orc_script(tokens[1])
+
+    return looks_like_orc_script(tokens[0])
+
+
 def analyze_command(command: str):
     """
     Returns:
@@ -74,7 +106,7 @@ def analyze_command(command: str):
         }
     """
     cmd = command.lower().strip()
-    tokens = split_command(cmd)
+    tokens = normalized_tokens(command)
 
     score = 0
     reasons = []
@@ -87,20 +119,23 @@ def analyze_command(command: str):
         if category not in categories:
             categories.append(category)
 
+    if is_self_invocation(command):
+        add(80, "Nested O.R.C. self-invocation detected.", "recursion")
+
     # Dangerous deletion patterns
-    if "rm -rf /" in cmd or "rm -rf /*" in cmd:
+    if has_token_sequence(tokens, ["rm", "-rf", "/"]) or has_token_sequence(tokens, ["rm", "-rf", "/*"]):
         add(100, "Recursive root deletion detected.", "destructive")
 
-    if "del /f /s /q" in cmd:
+    if has_token_sequence(tokens, ["del", "/f", "/s", "/q"]):
         add(80, "Forced recursive file deletion detected.", "destructive")
 
-    if "format " in cmd:
+    if tokens and tokens[0] == "format":
         add(90, "Disk format command detected.", "destructive")
 
-    if "mkfs" in cmd:
+    if tokens and tokens[0].startswith("mkfs"):
         add(90, "Filesystem creation command detected.", "destructive")
 
-    if "dd " in cmd and " of=/dev/" in cmd:
+    if tokens and tokens[0] == "dd" and any(token.startswith("of=/dev/") for token in tokens[1:]):
         add(95, "Raw disk write detected.", "destructive")
 
     # Generic deletion
@@ -112,50 +147,59 @@ def analyze_command(command: str):
         add(15, "File modification or movement command detected.", "filesystem")
 
     # Package / dependency changes
-    if "pip install" in cmd or "pip uninstall" in cmd:
+    if has_token_sequence(tokens, ["pip", "install"]) or has_token_sequence(tokens, ["pip", "uninstall"]):
         add(20, "Python package environment change detected.", "dependencies")
 
-    if "npm install" in cmd or "npm uninstall" in cmd or "npm update" in cmd:
+    if (
+        has_token_sequence(tokens, ["npm", "install"])
+        or has_token_sequence(tokens, ["npm", "uninstall"])
+        or has_token_sequence(tokens, ["npm", "update"])
+    ):
         add(20, "Node package environment change detected.", "dependencies")
 
-    if "apt install" in cmd or "apt remove" in cmd or "yum install" in cmd or "dnf install" in cmd:
+    if (
+        has_token_sequence(tokens, ["apt", "install"])
+        or has_token_sequence(tokens, ["apt", "remove"])
+        or has_token_sequence(tokens, ["yum", "install"])
+        or has_token_sequence(tokens, ["dnf", "install"])
+    ):
         add(25, "System package change detected.", "dependencies")
 
     # Publishing / deployment
-    if "npm publish" in cmd:
+    if has_token_sequence(tokens, ["npm", "publish"]):
         add(60, "Publishing to public package registry detected.", "deployment")
 
-    if "twine upload" in cmd:
+    if has_token_sequence(tokens, ["twine", "upload"]):
         add(60, "Python package upload detected.", "deployment")
 
-    if "docker push" in cmd:
+    if has_token_sequence(tokens, ["docker", "push"]):
         add(45, "Container image push detected.", "deployment")
 
-    if "git push" in cmd:
+    if has_token_sequence(tokens, ["git", "push"]):
         add(30, "Remote repository push detected.", "source_control")
 
-    if "git reset --hard" in cmd:
+    if has_token_sequence(tokens, ["git", "reset", "--hard"]):
         add(50, "Destructive git reset detected.", "source_control")
 
-    if "git clean -fd" in cmd or "git clean -fdx" in cmd:
+    if has_token_sequence(tokens, ["git", "clean", "-fd"]) or has_token_sequence(tokens, ["git", "clean", "-fdx"]):
         add(50, "Untracked files deletion detected.", "source_control")
 
     # Network / remote execution
-    if "curl " in cmd or "wget " in cmd or "invoke-webrequest" in cmd:
+    if tokens and tokens[0] in {"curl", "wget", "invoke-webrequest"}:
         add(20, "Network retrieval command detected.", "network")
 
-    if "ssh " in cmd or "scp " in cmd or "sftp " in cmd:
+    if tokens and tokens[0] in {"ssh", "scp", "sftp"}:
         add(35, "Remote access or transfer command detected.", "network")
 
     # Shell chaining / multiple commands
-    if "&&" in cmd or "||" in cmd or ";" in cmd:
+    if any(token in {"&&", "||", ";"} for token in tokens):
         add(15, "Multiple chained commands detected.", "shell_logic")
 
     # Elevated privilege attempts
-    if cmd.startswith("sudo "):
+    if tokens and tokens[0] == "sudo":
         add(40, "Elevated privilege execution detected.", "privilege")
 
-    if "powershell -executionpolicy bypass" in cmd:
+    if has_token_sequence(tokens, ["powershell", "-executionpolicy", "bypass"]):
         add(55, "PowerShell execution policy bypass detected.", "privilege")
 
     # Script execution
@@ -166,11 +210,11 @@ def analyze_command(command: str):
         add(10, "Interpreter or shell execution detected.", "execution")
 
     # Wildcards can increase blast radius
-    if "*" in cmd:
+    if any("*" in token for token in tokens):
         add(10, "Wildcard usage detected.", "scope")
 
     # Environment variable / secret-ish exposure
-    if "printenv" in cmd or "env" == cmd or "set " in cmd:
+    if tokens and tokens[0] in {"printenv", "env", "set"}:
         add(15, "Environment inspection detected.", "secrets")
 
     # Risk label
@@ -239,18 +283,19 @@ def execute_command(command: str):
     Executes the command in the user's shell.
     Returns a dict with exit code, stdout, stderr.
     """
-    tokens = split_command(command.lower())
-    interactive_roots = {
-        "python",
-        "python3",
-        "py",
-        "bash",
-        "sh",
-        "cmd",
-        "powershell",
-        "pwsh",
-    }
-    is_interactive = bool(tokens) and tokens[0] in interactive_roots
+    tokens = normalized_tokens(command)
+    is_interactive = False
+
+    if tokens:
+        root = tokens[0]
+        if root in {"python", "python3", "py"}:
+            is_interactive = len(tokens) == 1 or tokens[1] in {"-i"}
+        elif root in {"bash", "sh"}:
+            is_interactive = len(tokens) == 1
+        elif root in {"cmd"}:
+            is_interactive = len(tokens) == 1
+        elif root in {"powershell", "pwsh"}:
+            is_interactive = len(tokens) == 1
 
     try:
         if is_interactive:
