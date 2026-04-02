@@ -221,7 +221,10 @@ def get_user_decision(analysis: dict):
         prompt = "\nAction? [approve/edit/deny]: "
 
     while True:
-        choice = input(prompt).strip().lower()
+        try:
+            choice = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return "abort"
         if choice in {"approve", "a"}:
             return "approve"
         if choice in {"deny", "d"}:
@@ -236,17 +239,55 @@ def execute_command(command: str):
     Executes the command in the user's shell.
     Returns a dict with exit code, stdout, stderr.
     """
-    completed = subprocess.run(
-        command,
-        shell=True,
-        text=True,
-        capture_output=True
-    )
-    return {
-        "returncode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+    tokens = split_command(command.lower())
+    interactive_roots = {
+        "python",
+        "python3",
+        "py",
+        "bash",
+        "sh",
+        "cmd",
+        "powershell",
+        "pwsh",
     }
+    is_interactive = bool(tokens) and tokens[0] in interactive_roots
+
+    try:
+        if is_interactive:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                text=True,
+            )
+            return {
+                "returncode": completed.returncode,
+                "stdout": "",
+                "stderr": "",
+                "interrupted": False,
+                "interactive": True,
+            }
+
+        completed = subprocess.run(
+            command,
+            shell=True,
+            text=True,
+            capture_output=True
+        )
+        return {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "interrupted": False,
+            "interactive": False,
+        }
+    except KeyboardInterrupt:
+        return {
+            "returncode": 130,
+            "stdout": "",
+            "stderr": "",
+            "interrupted": True,
+            "interactive": is_interactive,
+        }
 
 
 def review_and_run(command: str):
@@ -257,6 +298,10 @@ def review_and_run(command: str):
         print_analysis(original_command, analysis)
 
         decision = get_user_decision(analysis)
+
+        if decision == "abort":
+            print("\n[O.R.C.] Review cancelled. Nothing was executed.")
+            return 130
 
         if decision == "deny":
             event = {
@@ -274,7 +319,11 @@ def review_and_run(command: str):
             return 1
 
         if decision == "edit":
-            edited = input("\nEnter edited command: ").strip()
+            try:
+                edited = input("\nEnter edited command: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[O.R.C.] Edit cancelled. Keeping original command.")
+                continue
             if not edited:
                 print("[O.R.C.] Edited command was empty. Keeping original command.")
             else:
@@ -297,9 +346,15 @@ def review_and_run(command: str):
                     "returncode": result["returncode"],
                     "stdout": result["stdout"],
                     "stderr": result["stderr"],
+                    "interrupted": result["interrupted"],
+                    "interactive": result["interactive"],
                 },
             }
             log_event(event)
+
+            if result["interrupted"]:
+                print("\n[O.R.C.] Command interrupted by user.")
+                return result["returncode"]
 
             if result["stdout"]:
                 print(result["stdout"], end="" if result["stdout"].endswith("\n") else "\n")
